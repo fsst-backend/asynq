@@ -13,11 +13,12 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
+	"github.com/spf13/cast"
+
 	"github.com/hibiken/asynq/internal/base"
 	"github.com/hibiken/asynq/internal/errors"
 	"github.com/hibiken/asynq/internal/timeutil"
-	"github.com/redis/go-redis/v9"
-	"github.com/spf13/cast"
 )
 
 const statsTTL = 90 * 24 * time.Hour // 90 days
@@ -214,9 +215,9 @@ func (r *RDB) EnqueueUnique(ctx context.Context, msg *base.TaskMessage, ttl time
 // KEYS[2] -> asynq:{<qname>}:paused
 // KEYS[3] -> asynq:{<qname>}:active
 // KEYS[4] -> asynq:{<qname>}:lease
+// KEYS[5] -> task key prefix
 // --
 // ARGV[1] -> initial lease expiration Unix time
-// ARGV[2] -> task key prefix
 //
 // Output:
 // Returns nil if no processable task is found in the given queue.
@@ -228,7 +229,7 @@ var dequeueCmd = redis.NewScript(`
 if redis.call("EXISTS", KEYS[2]) == 0 then
 	local id = redis.call("RPOPLPUSH", KEYS[1], KEYS[3])
 	if id then
-		local key = ARGV[2] .. id
+		local key = KEYS[5] .. id
 		redis.call("HSET", key, "state", "active")
 		redis.call("HDEL", key, "pending_since")
 		redis.call("ZADD", KEYS[4], ARGV[1], id)
@@ -249,11 +250,11 @@ func (r *RDB) Dequeue(qnames ...string) (msg *base.TaskMessage, leaseExpirationT
 			base.PausedKey(qname),
 			base.ActiveKey(qname),
 			base.LeaseKey(qname),
+			base.TaskKeyPrefix(qname),
 		}
 		leaseExpirationTime = r.clock.Now().Add(LeaseDuration)
 		argv := []interface{}{
 			leaseExpirationTime.Unix(),
-			base.TaskKeyPrefix(qname),
 		}
 		res, err := dequeueCmd.Run(context.Background(), r.client, keys, argv...).Result()
 		if err == redis.Nil {
@@ -952,18 +953,18 @@ func (r *RDB) ForwardIfReady(qnames ...string) error {
 
 // KEYS[1] -> source queue (e.g. asynq:{<qname>:scheduled or asynq:{<qname>}:retry})
 // KEYS[2] -> asynq:{<qname>}:pending
+// KEYS[3] -> task key prefix
+// KEYS[4] -> group key prefix
 // ARGV[1] -> current unix time in seconds
-// ARGV[2] -> task key prefix
-// ARGV[3] -> current unix time in nsec
-// ARGV[4] -> group key prefix
+// ARGV[2] -> current unix time in nsec
 // Note: Script moves tasks up to 100 at a time to keep the runtime of script short.
 var forwardCmd = redis.NewScript(`
 local ids = redis.call("ZRANGEBYSCORE", KEYS[1], "-inf", ARGV[1], "LIMIT", 0, 100)
 for _, id in ipairs(ids) do
-	local taskKey = ARGV[2] .. id
+	local taskKey = KEYS[3] .. id
 	local group = redis.call("HGET", taskKey, "group")
 	if group and group ~= '' then
-	    redis.call("ZADD", ARGV[4] .. group, ARGV[1], id)
+	    redis.call("ZADD", KEYS[4] .. group, ARGV[1], id)
 		redis.call("ZREM", KEYS[1], id)
 		redis.call("HSET", taskKey,
 				   "state", "aggregating")
@@ -972,7 +973,7 @@ for _, id in ipairs(ids) do
 		redis.call("ZREM", KEYS[1], id)
 		redis.call("HSET", taskKey,
 				   "state", "pending",
-				   "pending_since", ARGV[3])
+				   "pending_since", ARGV[2])
 	end
 end
 return table.getn(ids)`)
@@ -982,12 +983,10 @@ return table.getn(ids)`)
 // It returns the number of tasks moved.
 func (r *RDB) forward(delayedKey, pendingKey, taskKeyPrefix, groupKeyPrefix string) (int, error) {
 	now := r.clock.Now()
-	keys := []string{delayedKey, pendingKey}
+	keys := []string{delayedKey, pendingKey, taskKeyPrefix, groupKeyPrefix}
 	argv := []interface{}{
 		now.Unix(),
-		taskKeyPrefix,
 		now.UnixNano(),
-		groupKeyPrefix,
 	}
 	res, err := forwardCmd.Run(context.Background(), r.client, keys, argv...).Result()
 	if err != nil {
@@ -1156,8 +1155,7 @@ func (r *RDB) AggregationCheck(qname, gname string, t time.Time, gracePeriod, ma
 }
 
 // KEYS[1] -> asynq:{<qname>}:g:<gname>:<aggregation_set_id>
-// ------
-// ARGV[1] -> task key prefix
+// KEYS[2] -> task key prefix
 //
 // Output:
 // Array of encoded task messages
@@ -1168,7 +1166,7 @@ var readAggregationSetCmd = redis.NewScript(`
 local msgs = {}
 local ids = redis.call("ZRANGE", KEYS[1], 0, -1)
 for _, id in ipairs(ids) do
-	local key = ARGV[1] .. id
+	local key = KEYS[2] .. id
 	table.insert(msgs, redis.call("HGET", key, "msg"))
 end
 return msgs
@@ -1181,7 +1179,7 @@ func (r *RDB) ReadAggregationSet(qname, gname, setID string) ([]*base.TaskMessag
 	ctx := context.Background()
 	aggSetKey := base.AggregationSetKey(qname, gname, setID)
 	res, err := readAggregationSetCmd.Run(ctx, r.client,
-		[]string{aggSetKey}, base.TaskKeyPrefix(qname)).Result()
+		[]string{aggSetKey, base.TaskKeyPrefix(qname)}).Result()
 	if err != nil {
 		return nil, time.Time{}, errors.E(op, errors.Unknown, fmt.Sprintf("redis eval error: %v", err))
 	}
@@ -1206,9 +1204,7 @@ func (r *RDB) ReadAggregationSet(qname, gname, setID string) ([]*base.TaskMessag
 
 // KEYS[1] -> asynq:{<qname>}:g:<gname>:<aggregation_set_id>
 // KEYS[2] -> asynq:{<qname>}:aggregation_sets
-// -------
-// ARGV[1] -> task key prefix
-//
+// KEYS[3] -> task key prefix
 // Output:
 // Redis status reply
 //
@@ -1218,7 +1214,7 @@ func (r *RDB) ReadAggregationSet(qname, gname, setID string) ([]*base.TaskMessag
 var deleteAggregationSetCmd = redis.NewScript(`
 local ids = redis.call("ZRANGE", KEYS[1], 0, -1)
 for _, id in ipairs(ids)  do
-	redis.call("DEL", ARGV[1] .. id)
+	redis.call("DEL", KEYS[3] .. id)
 end
 redis.call("DEL", KEYS[1])
 redis.call("ZREM", KEYS[2], KEYS[1])
@@ -1262,15 +1258,15 @@ func (r *RDB) ReclaimStaleAggregationSets(qname string) error {
 }
 
 // KEYS[1] -> asynq:{<qname>}:completed
+// KEYS[2] -> task key prefix
 // ARGV[1] -> current time in unix time
-// ARGV[2] -> task key prefix
-// ARGV[3] -> batch size (i.e. maximum number of tasks to delete)
+// ARGV[2] -> batch size (i.e. maximum number of tasks to delete)
 //
 // Returns the number of tasks deleted.
 var deleteExpiredCompletedTasksCmd = redis.NewScript(`
-local ids = redis.call("ZRANGEBYSCORE", KEYS[1], "-inf", ARGV[1], "LIMIT", 0, tonumber(ARGV[3]))
+local ids = redis.call("ZRANGEBYSCORE", KEYS[1], "-inf", ARGV[1], "LIMIT", 0, tonumber(ARGV[2]))
 for _, id in ipairs(ids) do
-	redis.call("DEL", ARGV[2] .. id)
+	redis.call("DEL", KEYS[2] .. id)
 	redis.call("ZREM", KEYS[1], id)
 end
 return table.getn(ids)`)
@@ -1293,10 +1289,9 @@ func (r *RDB) DeleteExpiredCompletedTasks(qname string, batchSize int) error {
 // batch size. It reports the number of tasks deleted.
 func (r *RDB) deleteExpiredCompletedTasks(qname string, batchSize int) (int64, error) {
 	var op errors.Op = "rdb.DeleteExpiredCompletedTasks"
-	keys := []string{base.CompletedKey(qname)}
+	keys := []string{base.CompletedKey(qname), base.TaskKeyPrefix(qname)}
 	argv := []interface{}{
 		r.clock.Now().Unix(),
-		base.TaskKeyPrefix(qname),
 		batchSize,
 	}
 	res, err := deleteExpiredCompletedTasksCmd.Run(context.Background(), r.client, keys, argv...).Result()
@@ -1311,13 +1306,13 @@ func (r *RDB) deleteExpiredCompletedTasks(qname string, batchSize int) (int64, e
 }
 
 // KEYS[1] -> asynq:{<qname>}:lease
+// KEYS[2] -> task key prefix
 // ARGV[1] -> cutoff in unix time
-// ARGV[2] -> task key prefix
 var listLeaseExpiredCmd = redis.NewScript(`
 local res = {}
 local ids = redis.call("ZRANGEBYSCORE", KEYS[1], "-inf", ARGV[1])
 for _, id in ipairs(ids) do
-	local key = ARGV[2] .. id
+	local key = KEYS[2] .. id
 	local v = redis.call("HGET", key, "msg")
 	if v then
 		table.insert(res, v)
@@ -1332,8 +1327,8 @@ func (r *RDB) ListLeaseExpired(cutoff time.Time, qnames ...string) ([]*base.Task
 	var msgs []*base.TaskMessage
 	for _, qname := range qnames {
 		res, err := listLeaseExpiredCmd.Run(context.Background(), r.client,
-			[]string{base.LeaseKey(qname)},
-			cutoff.Unix(), base.TaskKeyPrefix(qname)).Result()
+			[]string{base.LeaseKey(qname), base.TaskKeyPrefix(qname)},
+			cutoff.Unix()).Result()
 		if err != nil {
 			return nil, errors.E(op, errors.Internal, fmt.Sprintf("redis eval error: %v", err))
 		}

@@ -10,10 +10,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hibiken/asynq/internal/base"
-	"github.com/hibiken/asynq/internal/errors"
 	"github.com/redis/go-redis/v9"
 	"github.com/spf13/cast"
+
+	"github.com/hibiken/asynq/internal/base"
+	"github.com/hibiken/asynq/internal/errors"
 )
 
 // AllQueues returns a list of all queue names.
@@ -89,9 +90,9 @@ type DailyStats struct {
 // KEYS[10] -> asynq:<qname>:failed
 // KEYS[11] -> asynq:<qname>:paused
 // KEYS[12] -> asynq:<qname>:groups
+// KEYS[13] -> task key prefix
+// KEYS[14] -> group key prefix
 // --------
-// ARGV[1] -> task key prefix
-// ARGV[2] -> group key prefix
 var currentStatsCmd = redis.NewScript(`
 local res = {}
 local pendingTaskCount = redis.call("LLEN", KEYS[1])
@@ -121,7 +122,7 @@ table.insert(res, redis.call("EXISTS", KEYS[11]))
 table.insert(res, "oldest_pending_since")
 if pendingTaskCount > 0 then
 	local id = redis.call("LRANGE", KEYS[1], -1, -1)[1]
-	table.insert(res, redis.call("HGET", ARGV[1] .. id, "pending_since"))
+	table.insert(res, redis.call("HGET", KEYS[13] .. id, "pending_since"))
 else
 	table.insert(res, 0)
 end
@@ -130,7 +131,7 @@ table.insert(res, "group_size")
 table.insert(res, table.getn(group_names))
 local aggregating_count = 0
 for _, gname in ipairs(group_names) do
-	aggregating_count = aggregating_count + redis.call("ZCARD", ARGV[2] .. gname)
+	aggregating_count = aggregating_count + redis.call("ZCARD", KEYS[14] .. gname)
 end
 table.insert(res, "aggregating_count")
 table.insert(res, aggregating_count)
@@ -160,11 +161,10 @@ func (r *RDB) CurrentStats(qname string) (*Stats, error) {
 		base.FailedTotalKey(qname),
 		base.PausedKey(qname),
 		base.AllGroups(qname),
-	}
-	argv := []interface{}{
 		base.TaskKeyPrefix(qname),
 		base.GroupKeyPrefix(qname),
 	}
+	argv := []interface{}{}
 	res, err := currentStatsCmd.Run(context.Background(), r.client, keys, argv...).Result()
 	if err != nil {
 		return nil, errors.E(op, errors.Unknown, err)
@@ -247,13 +247,13 @@ func (r *RDB) CurrentStats(qname string) (*Stats, error) {
 // KEYS[5] -> asynq:{qname}:archived
 // KEYS[6] -> asynq:{qname}:completed
 // KEYS[7] -> asynq:{qname}:groups
+// KEYS[8] -> asynq:{qname}:t: (task key prefix)
+// KEYS[9] -> asynq:{qname}:g: (group key prefix)
 // -------
-// ARGV[1] -> asynq:{qname}:t: (task key prefix)
-// ARGV[2] -> task sample size per redis list/zset (e.g 20)
-// ARGV[3] -> group sample size
-// ARGV[4] -> asynq:{qname}:g: (group key prefix)
+// ARGV[1] -> task sample size per redis list/zset (e.g 20)
+// ARGV[2] -> group sample size
 var memoryUsageCmd = redis.NewScript(`
-local sample_size = tonumber(ARGV[2])
+local sample_size = tonumber(ARGV[1])
 if sample_size <= 0 then
     return redis.error_reply("sample size must be a positive number")
 end
@@ -263,7 +263,7 @@ for i=1,2 do
     local sample_total = 0
     if (table.getn(ids) > 0) then
         for _, id in ipairs(ids) do
-            local bytes = redis.call("MEMORY", "USAGE", ARGV[1] .. id)
+            local bytes = redis.call("MEMORY", "USAGE", KEYS[8] .. id)
             sample_total = sample_total + bytes
         end
         local n = redis.call("LLEN", KEYS[i])
@@ -280,7 +280,7 @@ for i=3,6 do
     local sample_total = 0
     if (table.getn(ids) > 0) then
         for _, id in ipairs(ids) do
-            local bytes = redis.call("MEMORY", "USAGE", ARGV[1] .. id)
+            local bytes = redis.call("MEMORY", "USAGE", KEYS[8] .. id)
             sample_total = sample_total + bytes
         end
         local n = redis.call("ZCARD", KEYS[i])
@@ -298,12 +298,12 @@ if table.getn(groups) > 0 then
 	local agg_task_sample_total = 0
 	local agg_task_sample_size = 0
 	for i, gname in ipairs(groups) do
-		local group_key = ARGV[4] .. gname
+		local group_key = KEYS[9] .. gname
 		agg_task_count = agg_task_count + redis.call("ZCARD", group_key)
-		if i <= tonumber(ARGV[3]) then
+		if i <= tonumber(ARGV[2]) then
 			local ids = redis.call("ZRANGE", group_key, 0, sample_size - 1)
 			for _, id in ipairs(ids) do
-				local bytes = redis.call("MEMORY", "USAGE", ARGV[1] .. id)
+				local bytes = redis.call("MEMORY", "USAGE", KEYS[8] .. id)
 				agg_task_sample_total = agg_task_sample_total + bytes
 				agg_task_sample_size = agg_task_sample_size + 1
 			end
@@ -330,12 +330,12 @@ func (r *RDB) memoryUsage(qname string) (int64, error) {
 		base.ArchivedKey(qname),
 		base.CompletedKey(qname),
 		base.AllGroups(qname),
+		base.TaskKeyPrefix(qname),
+		base.GroupKeyPrefix(qname),
 	}
 	argv := []interface{}{
-		base.TaskKeyPrefix(qname),
 		taskSampleSize,
 		groupSampleSize,
-		base.GroupKeyPrefix(qname),
 	}
 	res, err := memoryUsageCmd.Run(context.Background(), r.client, keys, argv...).Result()
 	if err != nil {
@@ -455,9 +455,9 @@ func (r *RDB) checkQueueExists(qname string) error {
 
 // Input:
 // KEYS[1] -> task key (asynq:{<qname>}:t:<taskid>)
+// KYES[2] -> queue key prefix (asynq:{<qname>}:)
 // ARGV[1] -> task id
 // ARGV[2] -> current time in Unix time (seconds)
-// ARGV[3] -> queue key prefix (asynq:{<qname>}:)
 //
 // Output:
 // Tuple of {msg, state, nextProcessAt, result}
@@ -473,7 +473,7 @@ var getTaskInfoCmd = redis.NewScript(`
 	end
 	local msg, state, result = unpack(redis.call("HMGET", KEYS[1], "msg", "state", "result"))
 	if state == "scheduled" or state == "retry" then
-		return {msg, state, redis.call("ZSCORE", ARGV[3] .. state, ARGV[1]), result}
+		return {msg, state, redis.call("ZSCORE", KYES[2] .. state, ARGV[1]), result}
 	end
 	if state == "pending" then
 		return {msg, state, ARGV[2], result}
@@ -487,11 +487,10 @@ func (r *RDB) GetTaskInfo(qname, id string) (*base.TaskInfo, error) {
 	if err := r.checkQueueExists(qname); err != nil {
 		return nil, errors.E(op, errors.CanonicalCode(err), err)
 	}
-	keys := []string{base.TaskKey(qname, id)}
+	keys := []string{base.TaskKey(qname, id), base.QueueKeyPrefix(qname)}
 	argv := []interface{}{
 		id,
 		r.clock.Now().Unix(),
-		base.QueueKeyPrefix(qname),
 	}
 	res, err := getTaskInfoCmd.Run(context.Background(), r.client, keys, argv...).Result()
 	if err != nil {
@@ -556,8 +555,7 @@ type GroupStat struct {
 }
 
 // KEYS[1] -> asynq:{<qname>}:groups
-// -------
-// ARGV[1] -> group key prefix
+// KEYS[2] -> group key prefix
 //
 // Output:
 // list of group name and size (e.g. group1 size1 group2 size2 ...)
@@ -568,7 +566,7 @@ var groupStatsCmd = redis.NewScript(`
 local res = {}
 local group_names = redis.call("SMEMBERS", KEYS[1])
 for _, gname in ipairs(group_names) do
-	local size = redis.call("ZCARD", ARGV[1] .. gname)
+	local size = redis.call("ZCARD", KEYS[2] .. gname)
 	table.insert(res, gname)
 	table.insert(res, size)
 end
@@ -577,8 +575,8 @@ return res
 
 func (r *RDB) GroupStats(qname string) ([]*GroupStat, error) {
 	var op errors.Op = "RDB.GroupStats"
-	keys := []string{base.AllGroups(qname)}
-	argv := []interface{}{base.GroupKeyPrefix(qname)}
+	keys := []string{base.AllGroups(qname), base.GroupKeyPrefix(qname)}
+	argv := []interface{}{}
 	res, err := groupStatsCmd.Run(context.Background(), r.client, keys, argv...).Result()
 	if err != nil {
 		return nil, errors.E(op, errors.Unknown, err)
@@ -650,14 +648,14 @@ func (r *RDB) ListActive(qname string, pgn Pagination) ([]*base.TaskInfo, error)
 }
 
 // KEYS[1] -> key for id list (e.g. asynq:{<qname>}:pending)
+// KEYS[2] -> task key prefix
 // ARGV[1] -> start offset
 // ARGV[2] -> stop offset
-// ARGV[3] -> task key prefix
 var listMessagesCmd = redis.NewScript(`
 local ids = redis.call("LRange", KEYS[1], ARGV[1], ARGV[2])
 local data = {}
 for _, id in ipairs(ids) do
-	local key = ARGV[3] .. id
+	local key = KEYS[2] .. id
 	local msg, result = unpack(redis.call("HMGET", key, "msg","result"))
 	table.insert(data, msg)
 	table.insert(data, result)
@@ -681,7 +679,7 @@ func (r *RDB) listMessages(qname string, state base.TaskState, pgn Pagination) (
 	stop := -pgn.start() - 1
 	start := -pgn.stop() - 1
 	res, err := listMessagesCmd.Run(context.Background(), r.client,
-		[]string{key}, start, stop, base.TaskKeyPrefix(qname)).Result()
+		[]string{key, base.TaskKeyPrefix(qname)}, start, stop).Result()
 	if err != nil {
 		return nil, errors.E(errors.Unknown, err)
 	}
@@ -808,9 +806,9 @@ func (r *RDB) queueExists(qname string) (bool, error) {
 }
 
 // KEYS[1] -> key for ids set (e.g. asynq:{<qname>}:scheduled)
+// KEYS[2] > task key prefix
 // ARGV[1] -> min
 // ARGV[2] -> max
-// ARGV[3] -> task key prefix
 //
 // Returns an array populated with
 // [msg1, score1, result1, msg2, score2, result2, ..., msgN, scoreN, resultN]
@@ -820,7 +818,7 @@ local id_score_pairs = redis.call("ZRANGE", KEYS[1], ARGV[1], ARGV[2], "WITHSCOR
 for i = 1, table.getn(id_score_pairs), 2 do
 	local id = id_score_pairs[i]
 	local score = id_score_pairs[i+1]
-	local key = ARGV[3] .. id
+	local key = KEYS[2] .. id
 	local msg, res = unpack(redis.call("HMGET", key, "msg", "result"))
 	table.insert(data, msg)
 	table.insert(data, score)
@@ -832,8 +830,8 @@ return data
 // listZSetEntries returns a list of message and score pairs in Redis sorted-set
 // with the given key.
 func (r *RDB) listZSetEntries(qname string, state base.TaskState, key string, pgn Pagination) ([]*base.TaskInfo, error) {
-	res, err := listZSetEntriesCmd.Run(context.Background(), r.client, []string{key},
-		pgn.start(), pgn.stop(), base.TaskKeyPrefix(qname)).Result()
+	res, err := listZSetEntriesCmd.Run(context.Background(), r.client, []string{key, base.TaskKeyPrefix(qname)},
+		pgn.start(), pgn.stop()).Result()
 	if err != nil {
 		return nil, errors.E(errors.Unknown, err)
 	}
@@ -928,9 +926,9 @@ func (r *RDB) RunAllArchivedTasks(qname string) (int64, error) {
 // KEYS[1] -> asynq:{<qname>}:g:<gname>
 // KEYS[2] -> asynq:{<qname>}:pending
 // KEYS[3] -> asynq:{<qname>}:groups
+// KEYS[4] -> task key prefix
 // -------
-// ARGV[1] -> task key prefix
-// ARGV[2] -> group name
+// ARGV[1] -> group name
 //
 // Output:
 // integer: number of tasks scheduled to run
@@ -938,10 +936,10 @@ var runAllAggregatingCmd = redis.NewScript(`
 local ids = redis.call("ZRANGE", KEYS[1], 0, -1)
 for _, id in ipairs(ids) do
 	redis.call("LPUSH", KEYS[2], id)
-	redis.call("HSET", ARGV[1] .. id, "state", "pending")
+	redis.call("HSET", KEYS[4].. id, "state", "pending")
 end
 redis.call("DEL", KEYS[1])
-redis.call("SREM", KEYS[3], ARGV[2])
+redis.call("SREM", KEYS[3], ARGV[1])
 return table.getn(ids)
 `)
 
@@ -957,9 +955,9 @@ func (r *RDB) RunAllAggregatingTasks(qname, gname string) (int64, error) {
 		base.GroupKey(qname, gname),
 		base.PendingKey(qname),
 		base.AllGroups(qname),
+		base.TaskKeyPrefix(qname),
 	}
 	argv := []interface{}{
-		base.TaskKeyPrefix(qname),
 		gname,
 	}
 	res, err := runAllAggregatingCmd.Run(context.Background(), r.client, keys, argv...).Result()
@@ -979,10 +977,10 @@ func (r *RDB) RunAllAggregatingTasks(qname, gname string) (int64, error) {
 // KEYS[1] -> asynq:{<qname>}:t:<task_id>
 // KEYS[2] -> asynq:{<qname>}:pending
 // KEYS[3] -> asynq:{<qname>}:groups
+// KEYS[4] -> queue key prefix; asynq:{<qname>}:
+// KEYS[5] -> group key prefix
 // --
 // ARGV[1] -> task ID
-// ARGV[2] -> queue key prefix; asynq:{<qname>}:
-// ARGV[3] -> group key prefix
 //
 // Output:
 // Numeric code indicating the status:
@@ -1001,15 +999,15 @@ if state == "active" then
 elseif state == "pending" then
 	return -2
 elseif state == "aggregating" then
-	local n = redis.call("ZREM", ARGV[3] .. group, ARGV[1])
+	local n = redis.call("ZREM", KEYS[5] .. group, ARGV[1])
 	if n == 0 then
 		return redis.error_reply("internal error: task id not found in zset " .. tostring(ARGV[3] .. group))
 	end
-	if redis.call("ZCARD", ARGV[3] .. group) == 0 then
+	if redis.call("ZCARD", KEYS[5] .. group) == 0 then
 		redis.call("SREM", KEYS[3], group)
 	end
 else
-	local n = redis.call("ZREM", ARGV[2] .. state, ARGV[1])
+	local n = redis.call("ZREM", KEYS[4] .. state, ARGV[1])
 	if n == 0 then
 		return redis.error_reply("internal error: task id not found in zset " .. tostring(ARGV[2] .. state))
 	end
@@ -1034,11 +1032,11 @@ func (r *RDB) RunTask(qname, id string) error {
 		base.TaskKey(qname, id),
 		base.PendingKey(qname),
 		base.AllGroups(qname),
+		base.QueueKeyPrefix(qname),
+		base.GroupKeyPrefix(qname),
 	}
 	argv := []interface{}{
 		id,
-		base.QueueKeyPrefix(qname),
-		base.GroupKeyPrefix(qname),
 	}
 	res, err := runTaskCmd.Run(context.Background(), r.client, keys, argv...).Result()
 	if err != nil {
@@ -1068,8 +1066,8 @@ func (r *RDB) RunTask(qname, id string) error {
 // Input:
 // KEYS[1] -> zset which holds task ids (e.g. asynq:{<qname>}:scheduled)
 // KEYS[2] -> asynq:{<qname>}:pending
+// KEYS[3] -> task key prefix
 // --
-// ARGV[1] -> task key prefix
 //
 // Output:
 // integer: number of tasks updated to pending state.
@@ -1077,7 +1075,7 @@ var runAllCmd = redis.NewScript(`
 local ids = redis.call("ZRANGE", KEYS[1], 0, -1)
 for _, id in ipairs(ids) do
 	redis.call("LPUSH", KEYS[2], id)
-	redis.call("HSET", ARGV[1] .. id, "state", "pending")
+	redis.call("HSET", KEYS[3] .. id, "state", "pending")
 end
 redis.call("DEL", KEYS[1])
 return table.getn(ids)`)
@@ -1089,10 +1087,9 @@ func (r *RDB) runAll(zset, qname string) (int64, error) {
 	keys := []string{
 		zset,
 		base.PendingKey(qname),
-	}
-	argv := []interface{}{
 		base.TaskKeyPrefix(qname),
 	}
+	argv := []interface{}{}
 	res, err := runAllCmd.Run(context.Background(), r.client, keys, argv...).Result()
 	if err != nil {
 		return 0, err
@@ -1143,12 +1140,12 @@ func (r *RDB) ArchiveAllScheduledTasks(qname string) (int64, error) {
 // KEYS[1] -> asynq:{<qname>}:g:<gname>
 // KEYS[2] -> asynq:{<qname>}:archived
 // KEYS[3] -> asynq:{<qname>}:groups
+// KEYS[4] -> task key prefix (asynq:{<qname>}:t:)
 // -------
 // ARGV[1] -> current timestamp
 // ARGV[2] -> cutoff timestamp (e.g., 90 days ago)
 // ARGV[3] -> max number of tasks in archive (e.g., 100)
-// ARGV[4] -> task key prefix (asynq:{<qname>}:t:)
-// ARGV[5] -> group name
+// ARGV[4] -> group name
 //
 // Output:
 // integer: Number of tasks archived
@@ -1156,12 +1153,12 @@ var archiveAllAggregatingCmd = redis.NewScript(`
 local ids = redis.call("ZRANGE", KEYS[1], 0, -1)
 for _, id in ipairs(ids) do
 	redis.call("ZADD", KEYS[2], ARGV[1], id)
-	redis.call("HSET", ARGV[4] .. id, "state", "archived")
+	redis.call("HSET", KEYS[4] .. id, "state", "archived")
 end
 redis.call("ZREMRANGEBYSCORE", KEYS[2], "-inf", ARGV[2])
 redis.call("ZREMRANGEBYRANK", KEYS[2], 0, -ARGV[3])
 redis.call("DEL", KEYS[1])
-redis.call("SREM", KEYS[3], ARGV[5])
+redis.call("SREM", KEYS[3], ARGV[4])
 return table.getn(ids)
 `)
 
@@ -1177,13 +1174,13 @@ func (r *RDB) ArchiveAllAggregatingTasks(qname, gname string) (int64, error) {
 		base.GroupKey(qname, gname),
 		base.ArchivedKey(qname),
 		base.AllGroups(qname),
+		base.TaskKeyPrefix(qname),
 	}
 	now := r.clock.Now()
 	argv := []interface{}{
 		now.Unix(),
 		now.AddDate(0, 0, -archivedExpirationInDays).Unix(),
 		maxArchiveSize,
-		base.TaskKeyPrefix(qname),
 		gname,
 	}
 	res, err := archiveAllAggregatingCmd.Run(context.Background(), r.client, keys, argv...).Result()
@@ -1203,11 +1200,11 @@ func (r *RDB) ArchiveAllAggregatingTasks(qname, gname string) (int64, error) {
 // Input:
 // KEYS[1] -> asynq:{<qname>}:pending
 // KEYS[2] -> asynq:{<qname>}:archived
+// KEYS[4] -> task key prefix (asynq:{<qname>}:t:)
 // --
 // ARGV[1] -> current timestamp
 // ARGV[2] -> cutoff timestamp (e.g., 90 days ago)
 // ARGV[3] -> max number of tasks in archive (e.g., 100)
-// ARGV[4] -> task key prefix (asynq:{<qname>}:t:)
 //
 // Output:
 // integer: Number of tasks archived
@@ -1215,7 +1212,7 @@ var archiveAllPendingCmd = redis.NewScript(`
 local ids = redis.call("LRANGE", KEYS[1], 0, -1)
 for _, id in ipairs(ids) do
 	redis.call("ZADD", KEYS[2], ARGV[1], id)
-	redis.call("HSET", ARGV[4] .. id, "state", "archived")
+	redis.call("HSET", KEYS[4] .. id, "state", "archived")
 end
 redis.call("ZREMRANGEBYSCORE", KEYS[2], "-inf", ARGV[2])
 redis.call("ZREMRANGEBYRANK", KEYS[2], 0, -ARGV[3])
@@ -1233,13 +1230,13 @@ func (r *RDB) ArchiveAllPendingTasks(qname string) (int64, error) {
 	keys := []string{
 		base.PendingKey(qname),
 		base.ArchivedKey(qname),
+		base.TaskKeyPrefix(qname),
 	}
 	now := r.clock.Now()
 	argv := []interface{}{
 		now.Unix(),
 		now.AddDate(0, 0, -archivedExpirationInDays).Unix(),
 		maxArchiveSize,
-		base.TaskKeyPrefix(qname),
 	}
 	res, err := archiveAllPendingCmd.Run(context.Background(), r.client, keys, argv...).Result()
 	if err != nil {
@@ -1258,13 +1255,13 @@ func (r *RDB) ArchiveAllPendingTasks(qname string) (int64, error) {
 // KEYS[1] -> task key (asynq:{<qname>}:t:<task_id>)
 // KEYS[2] -> archived key (asynq:{<qname>}:archived)
 // KEYS[3] -> all groups key (asynq:{<qname>}:groups)
+// KEYS[5] -> queue key prefix (asynq:{<qname>}:)
+// KEYS[6] -> group key prefix (asynq:{<qname>}:g:)
 // --
 // ARGV[1] -> id of the task to archive
 // ARGV[2] -> current timestamp
 // ARGV[3] -> cutoff timestamp (e.g., 90 days ago)
 // ARGV[4] -> max number of tasks in archived state (e.g., 100)
-// ARGV[5] -> queue key prefix (asynq:{<qname>}:)
-// ARGV[6] -> group key prefix (asynq:{<qname>}:g:)
 //
 // Output:
 // Numeric code indicating the status:
@@ -1285,8 +1282,8 @@ if state == "archived" then
 	return -1
 end
 if state == "pending" then
-	if redis.call("LREM", ARGV[5] .. state, 1, ARGV[1]) == 0 then
-		return redis.error_reply("task id not found in list " .. tostring(ARGV[5] .. state))
+	if redis.call("LREM", KEYS[5] .. state, 1, ARGV[1]) == 0 then
+		return redis.error_reply("task id not found in list " .. tostring(KEYS[5] .. state))
 	end
 elseif state == "aggregating" then
 	if redis.call("ZREM", ARGV[6] .. group, ARGV[1]) == 0 then
@@ -1296,8 +1293,8 @@ elseif state == "aggregating" then
 		redis.call("SREM", KEYS[3], group)
 	end
 else
-	if redis.call("ZREM", ARGV[5] .. state, ARGV[1]) == 0 then
-		return redis.error_reply("task id not found in zset " .. tostring(ARGV[5] .. state))
+	if redis.call("ZREM", KEYS[5] .. state, ARGV[1]) == 0 then
+		return redis.error_reply("task id not found in zset " .. tostring(KEYS[5] .. state))
 	end
 end
 redis.call("ZADD", KEYS[2], ARGV[2], ARGV[1])
@@ -1323,6 +1320,8 @@ func (r *RDB) ArchiveTask(qname, id string) error {
 		base.TaskKey(qname, id),
 		base.ArchivedKey(qname),
 		base.AllGroups(qname),
+		base.QueueKeyPrefix(qname),
+		base.GroupKeyPrefix(qname),
 	}
 	now := r.clock.Now()
 	argv := []interface{}{
@@ -1330,8 +1329,6 @@ func (r *RDB) ArchiveTask(qname, id string) error {
 		now.Unix(),
 		now.AddDate(0, 0, -archivedExpirationInDays).Unix(),
 		maxArchiveSize,
-		base.QueueKeyPrefix(qname),
-		base.GroupKeyPrefix(qname),
 	}
 	res, err := archiveTaskCmd.Run(context.Background(), r.client, keys, argv...).Result()
 	if err != nil {
@@ -1363,11 +1360,11 @@ func (r *RDB) ArchiveTask(qname, id string) error {
 // Input:
 // KEYS[1] -> ZSET to move task from (e.g., asynq:{<qname>}:retry)
 // KEYS[2] -> asynq:{<qname>}:archived
+// KEYS[3] -> task key prefix (asynq:{<qname>}:t:)
 // --
 // ARGV[1] -> current timestamp
 // ARGV[2] -> cutoff timestamp (e.g., 90 days ago)
 // ARGV[3] -> max number of tasks in archive (e.g., 100)
-// ARGV[4] -> task key prefix (asynq:{<qname>}:t:)
 //
 // Output:
 // integer: number of tasks archived
@@ -1375,7 +1372,7 @@ var archiveAllCmd = redis.NewScript(`
 local ids = redis.call("ZRANGE", KEYS[1], 0, -1)
 for _, id in ipairs(ids) do
 	redis.call("ZADD", KEYS[2], ARGV[1], id)
-	redis.call("HSET", ARGV[4] .. id, "state", "archived")
+	redis.call("HSET", KEYS[3] .. id, "state", "archived")
 end
 redis.call("ZREMRANGEBYSCORE", KEYS[2], "-inf", ARGV[2])
 redis.call("ZREMRANGEBYRANK", KEYS[2], 0, -ARGV[3])
@@ -1389,13 +1386,13 @@ func (r *RDB) archiveAll(src, dst, qname string) (int64, error) {
 	keys := []string{
 		src,
 		dst,
+		base.TaskKeyPrefix(qname),
 	}
 	now := r.clock.Now()
 	argv := []interface{}{
 		now.Unix(),
 		now.AddDate(0, 0, -archivedExpirationInDays).Unix(),
 		maxArchiveSize,
-		base.TaskKeyPrefix(qname),
 		qname,
 	}
 	res, err := archiveAllCmd.Run(context.Background(), r.client, keys, argv...).Result()
@@ -1415,10 +1412,10 @@ func (r *RDB) archiveAll(src, dst, qname string) (int64, error) {
 // Input:
 // KEYS[1] -> asynq:{<qname>}:t:<task_id>
 // KEYS[2] -> asynq:{<qname>}:groups
+// KEYS[3] -> queue key prefix
+// KEYS[4] -> group key prefix
 // --
 // ARGV[1] -> task ID
-// ARGV[2] -> queue key prefix
-// ARGV[3] -> group key prefix
 //
 // Output:
 // Numeric code indicating the status:
@@ -1434,19 +1431,19 @@ if state == "active" then
 	return -1
 end
 if state == "pending" then
-	if redis.call("LREM", ARGV[2] .. state, 0, ARGV[1]) == 0 then
-		return redis.error_reply("task is not found in list: " .. tostring(ARGV[2] .. state))
+	if redis.call("LREM", KEYS[3] .. state, 0, ARGV[1]) == 0 then
+		return redis.error_reply("task is not found in list: " .. tostring(KEYS[3] .. state))
 	end
 elseif state == "aggregating" then
-	if redis.call("ZREM", ARGV[3] .. group, ARGV[1]) == 0 then
-		return redis.error_reply("task is not found in zset: " .. tostring(ARGV[3] .. group))
+	if redis.call("ZREM", KEYS[4] .. group, ARGV[1]) == 0 then
+		return redis.error_reply("task is not found in zset: " .. tostring(KEYS[4] .. group))
 	end
-	if redis.call("ZCARD", ARGV[3] .. group) == 0 then
+	if redis.call("ZCARD", KEYS[4] .. group) == 0 then
 		redis.call("SREM", KEYS[2], group)
 	end
 else
-	if redis.call("ZREM", ARGV[2] .. state, ARGV[1]) == 0 then
-		return redis.error_reply("task is not found in zset: " .. tostring(ARGV[2] .. state))
+	if redis.call("ZREM", KEYS[3] .. state, ARGV[1]) == 0 then
+		return redis.error_reply("task is not found in zset: " .. tostring(KEYS[3] .. state))
 	end
 end
 local unique_key = redis.call("HGET", KEYS[1], "unique_key")
@@ -1470,11 +1467,11 @@ func (r *RDB) DeleteTask(qname, id string) error {
 	keys := []string{
 		base.TaskKey(qname, id),
 		base.AllGroups(qname),
+		base.QueueKeyPrefix(qname),
+		base.GroupKeyPrefix(qname),
 	}
 	argv := []interface{}{
 		id,
-		base.QueueKeyPrefix(qname),
-		base.GroupKeyPrefix(qname),
 	}
 	res, err := deleteTaskCmd.Run(context.Background(), r.client, keys, argv...).Result()
 	if err != nil {
@@ -1556,15 +1553,15 @@ func (r *RDB) DeleteAllCompletedTasks(qname string) (int64, error) {
 //
 // Input:
 // KEYS[1] -> zset holding the task ids.
+// KEYS[2] -> task key prefix
 // --
-// ARGV[1] -> task key prefix
-//
+
 // Output:
 // integer: number of tasks deleted
 var deleteAllCmd = redis.NewScript(`
 local ids = redis.call("ZRANGE", KEYS[1], 0, -1)
 for _, id in ipairs(ids) do
-	local task_key = ARGV[1] .. id
+	local task_key = KEYS[2] .. id
 	local unique_key = redis.call("HGET", task_key, "unique_key")
 	if unique_key and unique_key ~= "" and redis.call("GET", unique_key) == id then
 		redis.call("DEL", unique_key)
@@ -1579,10 +1576,9 @@ func (r *RDB) deleteAll(key, qname string) (int64, error) {
 		return 0, err
 	}
 	argv := []interface{}{
-		base.TaskKeyPrefix(qname),
 		qname,
 	}
-	res, err := deleteAllCmd.Run(context.Background(), r.client, []string{key}, argv...).Result()
+	res, err := deleteAllCmd.Run(context.Background(), r.client, []string{key, base.TaskKeyPrefix(qname)}, argv...).Result()
 	if err != nil {
 		return 0, err
 	}
@@ -1598,15 +1594,15 @@ func (r *RDB) deleteAll(key, qname string) (int64, error) {
 // Input:
 // KEYS[1] -> asynq:{<qname>}:g:<gname>
 // KEYS[2] -> asynq:{<qname>}:groups
+// KEYS[3] -> task key prefix
 // -------
-// ARGV[1] -> task key prefix
 // ARGV[2] -> group name
 var deleteAllAggregatingCmd = redis.NewScript(`
 local ids = redis.call("ZRANGE", KEYS[1], 0, -1)
 for _, id in ipairs(ids) do
-	redis.call("DEL", ARGV[1] .. id)
+	redis.call("DEL", KEYS[3] .. id)
 end
-redis.call("SREM", KEYS[2], ARGV[2])
+redis.call("SREM", KEYS[2], ARGV[1])
 redis.call("DEL", KEYS[1])
 return table.getn(ids)
 `)
@@ -1621,9 +1617,9 @@ func (r *RDB) DeleteAllAggregatingTasks(qname, gname string) (int64, error) {
 	keys := []string{
 		base.GroupKey(qname, gname),
 		base.AllGroups(qname),
+		base.TaskKeyPrefix(qname),
 	}
 	argv := []interface{}{
-		base.TaskKeyPrefix(qname),
 		gname,
 	}
 	res, err := deleteAllAggregatingCmd.Run(context.Background(), r.client, keys, argv...).Result()
@@ -1641,15 +1637,15 @@ func (r *RDB) DeleteAllAggregatingTasks(qname, gname string) (int64, error) {
 //
 // Input:
 // KEYS[1] -> asynq:{<qname>}:pending
+// KEYS[2] -> task key prefix
 // --
-// ARGV[1] -> task key prefix
 //
 // Output:
 // integer: number of tasks deleted
 var deleteAllPendingCmd = redis.NewScript(`
 local ids = redis.call("LRANGE", KEYS[1], 0, -1)
 for _, id in ipairs(ids) do
-	redis.call("DEL", ARGV[1] .. id)
+	redis.call("DEL", KEYS[2] .. id)
 end
 redis.call("DEL", KEYS[1])
 return table.getn(ids)`)
@@ -1663,10 +1659,9 @@ func (r *RDB) DeleteAllPendingTasks(qname string) (int64, error) {
 	}
 	keys := []string{
 		base.PendingKey(qname),
-	}
-	argv := []interface{}{
 		base.TaskKeyPrefix(qname),
 	}
+	argv := []interface{}{}
 	res, err := deleteAllPendingCmd.Run(context.Background(), r.client, keys, argv...).Result()
 	if err != nil {
 		return 0, errors.E(op, errors.Unknown, err)
@@ -1689,8 +1684,8 @@ func (r *RDB) DeleteAllPendingTasks(qname string) (int64, error) {
 // KEYS[4] -> asynq:{<qname>}:retry
 // KEYS[5] -> asynq:{<qname>}:archived
 // KEYS[6] -> asynq:{<qname>}:lease
+// KEYS[7] -> task key prefix
 // --
-// ARGV[1] -> task key prefix
 //
 // Output:
 // Numeric code to indicate the status.
@@ -1702,34 +1697,34 @@ if active > 0 then
     return -2
 end
 for _, id in ipairs(redis.call("LRANGE", KEYS[1], 0, -1)) do
-	redis.call("DEL", ARGV[1] .. id)
+	redis.call("DEL", KEYS[7] .. id)
 end
 for _, id in ipairs(redis.call("LRANGE", KEYS[2], 0, -1)) do
-	redis.call("DEL", ARGV[1] .. id)
+	redis.call("DEL", KEYS[7] .. id)
 end
 for _, id in ipairs(redis.call("ZRANGE", KEYS[3], 0, -1)) do
-	redis.call("DEL", ARGV[1] .. id)
+	redis.call("DEL", KEYS[7] .. id)
 end
 for _, id in ipairs(redis.call("ZRANGE", KEYS[4], 0, -1)) do
-	redis.call("DEL", ARGV[1] .. id)
+	redis.call("DEL", KEYS[7] .. id)
 end
 for _, id in ipairs(redis.call("ZRANGE", KEYS[5], 0, -1)) do
-	redis.call("DEL", ARGV[1] .. id)
+	redis.call("DEL", KEYS[7] .. id)
 end
 for _, id in ipairs(redis.call("LRANGE", KEYS[1], 0, -1)) do
-	redis.call("DEL", ARGV[1] .. id)
+	redis.call("DEL", KEYS[7] .. id)
 end
 for _, id in ipairs(redis.call("LRANGE", KEYS[2], 0, -1)) do
-	redis.call("DEL", ARGV[1] .. id)
+	redis.call("DEL", KEYS[7] .. id)
 end
 for _, id in ipairs(redis.call("ZRANGE", KEYS[3], 0, -1)) do
-	redis.call("DEL", ARGV[1] .. id)
+	redis.call("DEL", KEYS[7] .. id)
 end
 for _, id in ipairs(redis.call("ZRANGE", KEYS[4], 0, -1)) do
-	redis.call("DEL", ARGV[1] .. id)
+	redis.call("DEL", KEYS[7] .. id)
 end
 for _, id in ipairs(redis.call("ZRANGE", KEYS[5], 0, -1)) do
-	redis.call("DEL", ARGV[1] .. id)
+	redis.call("DEL", KEYS[7] .. id)
 end
 redis.call("DEL", KEYS[1])
 redis.call("DEL", KEYS[2])
@@ -1749,8 +1744,8 @@ return 1`)
 // KEYS[4] -> asynq:{<qname>}:retry
 // KEYS[5] -> asynq:{<qname>}:archived
 // KEYS[6] -> asynq:{<qname>}:lease
+// KEYS[7] -> task key prefix
 // --
-// ARGV[1] -> task key prefix
 //
 // Output:
 // Numeric code to indicate the status
@@ -1777,10 +1772,10 @@ if table.getn(ids) > 0 then
 	return -1
 end
 for _, id in ipairs(ids) do
-	redis.call("DEL", ARGV[1] .. id)
+	redis.call("DEL", KEYS[7] .. id)
 end
 for _, id in ipairs(ids) do
-	redis.call("DEL", ARGV[1] .. id)
+	redis.call("DEL", KEYS[7] .. id)
 end
 redis.call("DEL", KEYS[1])
 redis.call("DEL", KEYS[2])
@@ -1818,8 +1813,9 @@ func (r *RDB) RemoveQueue(qname string, force bool) error {
 		base.RetryKey(qname),
 		base.ArchivedKey(qname),
 		base.LeaseKey(qname),
+		base.TaskKeyPrefix(qname),
 	}
-	res, err := script.Run(context.Background(), r.client, keys, base.TaskKeyPrefix(qname)).Result()
+	res, err := script.Run(context.Background(), r.client, keys).Result()
 	if err != nil {
 		return errors.E(op, errors.Unknown, err)
 	}
