@@ -1,64 +1,53 @@
-# Asynq CLI
+# asynq CLI
 
-Asynq CLI is a command line tool to monitor the queues and tasks managed by `asynq` package.
+命令行工具，用于查看和操作 asynq 管理的队列与任务。代码原样来自上游 [hibiken/asynq](https://github.com/hibiken/asynq/tree/master/tools/asynq)。
 
-## Table of Contents
+> 与本分叉的关系：`tools/` 是独立 module（`github.com/hibiken/asynq/tools`），其 `go.mod` 依赖上游发布的 `github.com/hibiken/asynq v0.25.0`，没有 `replace` 到本仓库根。所以无论在本仓库编译还是 `go install` 上游版本，CLI 使用的都是**上游**的 Redis 脚本，不包含本分叉对 `internal/rdb` 的改动。键名与数据结构两者一致，CLI 可以读写同一个 Redis；但如果所连的 Redis 部署拒绝上游脚本的访问方式（本分叉要解决的问题，见根 [README](../../README.md)），CLI 的部分命令会失败。
 
-- [Installation](#installation)
-- [Usage](#usage)
-- [Config File](#config-file)
+## 安装
 
-## Installation
+```sh
+# 在本仓库内编译
+cd tools && go build -o asynq ./asynq
 
-In order to use the tool, compile it using the following command:
-
-    go install github.com/hibiken/asynq/tools/asynq@latest
-
-This will create the asynq executable under your `$GOPATH/bin` directory.
-
-## Usage
-
-### Commands
-
-To view details on any command, use `asynq help <command> <subcommand>`.
-
-- `asynq dash`
-- `asynq stats`
-- `asynq queue [ls inspect history rm pause unpause]`
-- `asynq task [ls cancel delete archive run deleteall archiveall runall]`
-- `asynq server [ls]`
-
-### Global flags
-
-Asynq CLI needs to connect to a redis-server to inspect the state of queues and tasks. Use flags to specify the options to connect to the redis-server used by your application.
-To connect to a redis cluster, pass `--cluster` and `--cluster_addrs` flags.
-
-By default, CLI will try to connect to a redis server running at `localhost:6379`.
-
-```
-      --config string          config file to set flag defaut values (default is $HOME/.asynq.yaml)
-  -n, --db int                 redis database number (default is 0)
-  -h, --help                   help for asynq
-  -p, --password string        password to use when connecting to redis server
-  -u, --uri string             redis server URI (default "127.0.0.1:6379")
-
-      --cluster                connect to redis cluster
-      --cluster_addrs string   list of comma-separated redis server addresses
+# 或安装上游版本
+go install github.com/hibiken/asynq/tools/asynq@latest
 ```
 
-## Config File
+## 命令
 
-You can use a config file to set default values for the flags.
+用 `asynq help <command> <subcommand>` 查看详细用法。
 
-By default, `asynq` will try to read config file located in
-`$HOME/.asynq.(yml|json)`. You can specify the file location via `--config` flag.
+| 命令 | 子命令 |
+|------|--------|
+| `asynq dash` | 终端仪表盘，`--refresh` 设置刷新间隔（默认 8s） |
+| `asynq stats` | 汇总统计 |
+| `asynq queue` | `list`（`ls`）、`inspect`、`history`、`pause`、`resume`（`unpause`）、`remove`（`rm`、`delete`） |
+| `asynq task` | `list`（`ls`）、`inspect`、`cancel`、`archive`、`delete`（`rm`、`remove`）、`run`、`enqueue`、`archiveall`、`deleteall`、`runall` |
+| `asynq group` | `list`（`ls`） |
+| `asynq cron` | `list`（`ls`）、`history` |
+| `asynq server` | `list`（`ls`） |
+| `asynq version` | 版本信息 |
 
-Config file example:
+## 连接参数（全局 flag）
+
+| flag | 默认值 | 说明 |
+|------|--------|------|
+| `--config` | `$HOME/.asynq.(yaml\|yml\|json)` | 配置文件，用来设置下列 flag 的默认值 |
+| `-u, --uri` | `127.0.0.1:6379` | Redis 地址 |
+| `-n, --db` | `0` | Redis db 编号 |
+| `-p, --password` | 空 | Redis 密码 |
+| `--cluster` | `false` | 以集群模式连接 |
+| `--cluster_addrs` | 本机 7000–7005 端口 | 集群节点地址，逗号分隔 |
+| `--tls_server` | 空 | TLS 校验用的服务器名 |
+| `--insecure` | `false` | 跳过 TLS 证书校验 |
+
+配置文件示例（键名与 flag 同名）：
 
 ```yaml
 uri: 127.0.0.1:6379
 db: 2
-password: mypassword
+password: <redis 密码>
 ```
 
-This will set the default values for `--uri`, `--db`, and `--password` flags.
+对生产 Redis 执行 `pause`、`remove`、`archive`、`delete`、`*all` 等写操作前需负责人确认。
