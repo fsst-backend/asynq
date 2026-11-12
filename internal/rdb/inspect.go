@@ -455,7 +455,7 @@ func (r *RDB) checkQueueExists(qname string) error {
 
 // Input:
 // KEYS[1] -> task key (asynq:{<qname>}:t:<taskid>)
-// KYES[2] -> queue key prefix (asynq:{<qname>}:)
+// KEYS[2] -> queue key prefix (asynq:{<qname>}:)
 // ARGV[1] -> task id
 // ARGV[2] -> current time in Unix time (seconds)
 //
@@ -473,7 +473,7 @@ var getTaskInfoCmd = redis.NewScript(`
 	end
 	local msg, state, result = unpack(redis.call("HMGET", KEYS[1], "msg", "state", "result"))
 	if state == "scheduled" or state == "retry" then
-		return {msg, state, redis.call("ZSCORE", KYES[2] .. state, ARGV[1]), result}
+		return {msg, state, redis.call("ZSCORE", KEYS[2] .. state, ARGV[1]), result}
 	end
 	if state == "pending" then
 		return {msg, state, ARGV[2], result}
