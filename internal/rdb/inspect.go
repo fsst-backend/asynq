@@ -1001,7 +1001,7 @@ elseif state == "pending" then
 elseif state == "aggregating" then
 	local n = redis.call("ZREM", KEYS[5] .. group, ARGV[1])
 	if n == 0 then
-		return redis.error_reply("internal error: task id not found in zset " .. tostring(ARGV[3] .. group))
+		return redis.error_reply("internal error: task id not found in zset " .. tostring(KEYS[5] .. group))
 	end
 	if redis.call("ZCARD", KEYS[5] .. group) == 0 then
 		redis.call("SREM", KEYS[3], group)
@@ -1009,7 +1009,7 @@ elseif state == "aggregating" then
 else
 	local n = redis.call("ZREM", KEYS[4] .. state, ARGV[1])
 	if n == 0 then
-		return redis.error_reply("internal error: task id not found in zset " .. tostring(ARGV[2] .. state))
+		return redis.error_reply("internal error: task id not found in zset " .. tostring(KEYS[4] .. state))
 	end
 end
 redis.call("LPUSH", KEYS[2], ARGV[1])
@@ -1200,7 +1200,7 @@ func (r *RDB) ArchiveAllAggregatingTasks(qname, gname string) (int64, error) {
 // Input:
 // KEYS[1] -> asynq:{<qname>}:pending
 // KEYS[2] -> asynq:{<qname>}:archived
-// KEYS[4] -> task key prefix (asynq:{<qname>}:t:)
+// KEYS[3] -> task key prefix (asynq:{<qname>}:t:)
 // --
 // ARGV[1] -> current timestamp
 // ARGV[2] -> cutoff timestamp (e.g., 90 days ago)
@@ -1212,7 +1212,7 @@ var archiveAllPendingCmd = redis.NewScript(`
 local ids = redis.call("LRANGE", KEYS[1], 0, -1)
 for _, id in ipairs(ids) do
 	redis.call("ZADD", KEYS[2], ARGV[1], id)
-	redis.call("HSET", KEYS[4] .. id, "state", "archived")
+	redis.call("HSET", KEYS[3] .. id, "state", "archived")
 end
 redis.call("ZREMRANGEBYSCORE", KEYS[2], "-inf", ARGV[2])
 redis.call("ZREMRANGEBYRANK", KEYS[2], 0, -ARGV[3])
@@ -1255,8 +1255,8 @@ func (r *RDB) ArchiveAllPendingTasks(qname string) (int64, error) {
 // KEYS[1] -> task key (asynq:{<qname>}:t:<task_id>)
 // KEYS[2] -> archived key (asynq:{<qname>}:archived)
 // KEYS[3] -> all groups key (asynq:{<qname>}:groups)
-// KEYS[5] -> queue key prefix (asynq:{<qname>}:)
-// KEYS[6] -> group key prefix (asynq:{<qname>}:g:)
+// KEYS[4] -> queue key prefix (asynq:{<qname>}:)
+// KEYS[5] -> group key prefix (asynq:{<qname>}:g:)
 // --
 // ARGV[1] -> id of the task to archive
 // ARGV[2] -> current timestamp
@@ -1282,19 +1282,19 @@ if state == "archived" then
 	return -1
 end
 if state == "pending" then
-	if redis.call("LREM", KEYS[5] .. state, 1, ARGV[1]) == 0 then
-		return redis.error_reply("task id not found in list " .. tostring(KEYS[5] .. state))
+	if redis.call("LREM", KEYS[4] .. state, 1, ARGV[1]) == 0 then
+		return redis.error_reply("task id not found in list " .. tostring(KEYS[4] .. state))
 	end
 elseif state == "aggregating" then
-	if redis.call("ZREM", ARGV[6] .. group, ARGV[1]) == 0 then
-		return redis.error_reply("task id not found in zset " .. tostring(ARGV[6] .. group))
+	if redis.call("ZREM", KEYS[5] .. group, ARGV[1]) == 0 then
+		return redis.error_reply("task id not found in zset " .. tostring(KEYS[5] .. group))
 	end
-	if redis.call("ZCARD", ARGV[6] .. group) == 0 then
+	if redis.call("ZCARD", KEYS[5] .. group) == 0 then
 		redis.call("SREM", KEYS[3], group)
 	end
 else
-	if redis.call("ZREM", KEYS[5] .. state, ARGV[1]) == 0 then
-		return redis.error_reply("task id not found in zset " .. tostring(KEYS[5] .. state))
+	if redis.call("ZREM", KEYS[4] .. state, ARGV[1]) == 0 then
+		return redis.error_reply("task id not found in zset " .. tostring(KEYS[4] .. state))
 	end
 end
 redis.call("ZADD", KEYS[2], ARGV[2], ARGV[1])

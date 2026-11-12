@@ -1227,8 +1227,9 @@ func (r *RDB) DeleteAggregationSet(ctx context.Context, qname, gname, setID stri
 	keys := []string{
 		base.AggregationSetKey(qname, gname, setID),
 		base.AllAggregationSets(qname),
+		base.TaskKeyPrefix(qname),
 	}
-	return r.runScript(ctx, op, deleteAggregationSetCmd, keys, base.TaskKeyPrefix(qname))
+	return r.runScript(ctx, op, deleteAggregationSetCmd, keys)
 }
 
 // KEYS[1] -> asynq:{<qname>}:aggregation_sets

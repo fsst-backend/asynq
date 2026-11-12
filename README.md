@@ -21,19 +21,17 @@
 
 改动目的：提交说明只写了「将任务 key 前缀和组 key 前缀作为 KEYS 参数传递给 Redis 脚本」，没有写明动机。从改动看，是为了让脚本访问的键都能由 `KEYS` 推出，以适配要求 Lua 脚本声明所访问键的 Redis 部署（上游 README 也注明部分脚本可能不兼容 Redis Cluster）——**具体动机待确认**。
 
-### 已知问题
+### 已修复的脚本参数错误
 
-与上游比对时发现以下脚本参数位置不一致（本次未修改代码），使用相关功能前需先修复：
+分叉导入时有 5 处脚本参数下标与调用处不一致（2026-10-14 比对发现），2026-11-12 已全部修复，`internal/rdb` 全部测试在真实 Redis 上通过：
 
-| 位置 | 问题 | 影响 |
+| 位置 | 原问题 | 原影响 |
 |------|------|------|
-| `internal/rdb/inspect.go` `getTaskInfoCmd` | 脚本中写成 `KYES[2]`（拼写错误） | `Inspector.GetTaskInfo` 查询 scheduled / retry 状态的任务时 Lua 报错 |
-| `internal/rdb/inspect.go` `archiveTaskCmd` | 调用方传 5 个 KEYS（队列前缀在 `KEYS[4]`、分组前缀在 `KEYS[5]`），脚本却用 `KEYS[5]` 当队列前缀、用 `ARGV[6]`（已不存在）当分组前缀 | `Inspector.ArchiveTask` 对各状态任务均无法正确归档 |
-| `internal/rdb/inspect.go` `archiveAllPendingCmd` | 调用方传 3 个 KEYS，脚本使用 `KEYS[4]` | `Inspector.ArchiveAllPendingTasks` 在有 pending 任务时 Lua 报错 |
-| `internal/rdb/rdb.go` `DeleteAggregationSet` | 脚本使用 `KEYS[3]`，调用方只传 2 个 KEYS、前缀仍放在 `ARGV` | 使用任务分组聚合（`asynq.Group` + `GroupAggregator`）时删除聚合集报错 |
-| `internal/rdb/inspect.go` `runTaskCmd` | 两处错误提示仍拼接旧的 `ARGV[2]` / `ARGV[3]` | 仅在数据异常的报错分支触发，报错信息变成 Lua 错误 |
-
-这些都在 `Inspector`（asynqmon 的查看/归档操作走这里）或分组聚合路径上。入队、出队、重试、定时转发等主流程脚本要么未改动，要么改动后经核对与调用处一致。
+| `internal/rdb/inspect.go` `getTaskInfoCmd` | 脚本中写成 `KYES[2]`（拼写错误） | `Inspector.GetTaskInfo` 查询 scheduled / retry 状态的任务时 Lua 报错；violet durabletask 台账核对不了重试中的任务，进程重启后被中断的任务一直等到 asynq 自行重试 |
+| `internal/rdb/inspect.go` `archiveTaskCmd` | 队列前缀用了 `KEYS[5]`、分组前缀用了已不存在的 `ARGV[6]` | `Inspector.ArchiveTask` 无法归档 |
+| `internal/rdb/inspect.go` `archiveAllPendingCmd` | 调用方传 3 个 KEYS，脚本使用 `KEYS[4]` | `Inspector.ArchiveAllPendingTasks` 报错 |
+| `internal/rdb/rdb.go` `DeleteAggregationSet` | 脚本用 `KEYS[3]`，调用方把前缀放在 `ARGV` | 分组聚合删除聚合集报错 |
+| `internal/rdb/inspect.go` `runTaskCmd` | 错误提示拼接旧的 `ARGV[2]` / `ARGV[3]` | 数据异常分支的报错变成 Lua 错误 |
 
 ## 如何被使用
 
@@ -70,7 +68,7 @@ replace github.com/hibiken/asynq => ../asynq
 
 1. 先读上游 `CHANGELOG.md` 中 v0.25.1 之后的变更，尤其是 Redis 数据结构或脚本参数的改动——集群中新旧版本 worker 会同时访问同一个 Redis。
 2. 以新的上游 tag 为基础，把本分叉的改动重新应用一遍：逐个检查 `internal/rdb/` 中所有 `redis.NewScript`，凡是在脚本里用 `ARGV[n] .. xxx` 拼出键名的，改为把前缀放进 `KEYS`，并同步调整调用处的 `keys` / `argv` 切片和脚本头部注释。上游新增的脚本也要按同样规则处理。
-3. 改完后核对每个脚本里 `KEYS[n]` / `ARGV[n]` 的下标与调用处切片的长度、顺序一致（上节「已知问题」都属于这一类错误），并在真实 Redis（含集群模式 `-redis_cluster`）上跑完整 `go test ./...`。
+3. 改完后核对每个脚本里 `KEYS[n]` / `ARGV[n]` 的下标与调用处切片的长度、顺序一致（上节「已修复的脚本参数错误」都属于这一类错误），并在真实 Redis（含集群模式 `-redis_cluster`）上跑完整 `go test ./...`。
 4. 更新本文件的「分叉基线」和「与上游的差异」。
 5. 在同级检出的 violet 中 `go build ./...`，并验证 `stask` / `gtask` 的入队与消费。
 
@@ -149,7 +147,7 @@ if err := scheduler.Run(); err != nil {
 }
 ```
 
-监控与运维：Web 界面 [asynqmon](https://github.com/hibiken/asynqmon)；命令行见 [tools/asynq/README.md](tools/asynq/README.md)；程序内可用 `asynq.NewInspector` 查询和操作队列（注意上文「已知问题」）。
+监控与运维：Web 界面 [asynqmon](https://github.com/hibiken/asynqmon)；命令行见 [tools/asynq/README.md](tools/asynq/README.md)；程序内可用 `asynq.NewInspector` 查询和操作队列。
 
 ## 许可证
 
